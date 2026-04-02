@@ -678,4 +678,149 @@ UPDATE posts SET view_count = view_count + 1 WHERE id = :postId
 
 ## 5. Test Scenarios (Given-When-Then)
 
-TODO
+### 5.1 Anonymous Nickname
+
+**T1: First-time user gets a nickname in anonymous channel**
+- Given: an ANONYMOUS channel with a post (id=10), user_1 has no nickname for this post
+- When: user_1 creates a comment on post 10
+- Then: a nickname is generated, stored in anonymous_nicknames, and returned in the response
+
+**T2: Same user gets same nickname within same post**
+- Given: user_1 already has nickname "Brave Whale" for post 10
+- When: user_1 creates another comment on post 10
+- Then: author.nickname is "Brave Whale" (reused, not regenerated)
+
+**T3: Same user gets different nickname on different post**
+- Given: user_1 has nickname "Brave Whale" for post 10
+- When: user_1 creates a comment on post 20
+- Then: a new nickname is generated (not "Brave Whale")
+
+**T4: Nickname collision under concurrency**
+- Given: post 10 has no nicknames yet
+- When: two users simultaneously get assigned "Brave Whale"
+- Then: one succeeds, the other retries with a different nickname. Both end up with unique nicknames.
+
+**T5: Real-name channel skips nickname**
+- Given: a REAL_NAME channel with a post
+- When: user_1 creates a comment
+- Then: author.userId is "user_1", author.nickname is null
+
+### 5.2 Reactions
+
+**T6: Add a reaction**
+- Given: post 10 has 0 likes, user_1 has no reaction
+- When: user_1 sends POST /api/posts/10/reactions {"type": "LIKE"}
+- Then: action = "ADDED", likeCount = 1, dislikeCount = 0
+
+**T7: Cancel a reaction (same type again)**
+- Given: user_1 has LIKE on post 10, likeCount = 1
+- When: user_1 sends POST /api/posts/10/reactions {"type": "LIKE"}
+- Then: action = "CANCELLED", type = null, likeCount = 0
+
+**T8: Switch a reaction**
+- Given: user_1 has LIKE on post 10, likeCount = 1, dislikeCount = 0
+- When: user_1 sends POST /api/posts/10/reactions {"type": "DISLIKE"}
+- Then: action = "SWITCHED", type = "DISLIKE", likeCount = 0, dislikeCount = 1
+
+**T9: Double-click reaction (concurrent)**
+- Given: user_1 has no reaction on post 10
+- When: two identical LIKE requests arrive simultaneously
+- Then: one adds, the other catches the constraint violation and cancels. Final state: no reaction (net toggle).
+
+**T10: React to soft-deleted comment**
+- Given: comment 100 is soft-deleted (is_deleted = true)
+- When: user_1 sends POST /api/comments/100/reactions {"type": "LIKE"}
+- Then: 400 Bad Request
+
+### 5.3 Comments & Soft Delete
+
+**T11: Create top-level comment**
+- Given: post 10 exists, comment_count = 0
+- When: user_1 sends POST /api/comments {"postId": 10, "parentId": null, "content": "Hello"}
+- Then: comment created, post comment_count = 1
+
+**T12: Create reply**
+- Given: top-level comment 100 exists on post 10
+- When: user_2 sends POST /api/comments {"postId": 10, "parentId": 100, "content": "Reply"}
+- Then: reply created with parentId = 100, post comment_count incremented
+
+**T13: Reject nested reply (reply to a reply)**
+- Given: comment 101 is a reply (parent_id = 100)
+- When: user_3 sends POST /api/comments {"postId": 10, "parentId": 101, "content": "Nested"}
+- Then: 400 Bad Request
+
+**T14: Soft delete comment with replies**
+- Given: comment 100 has 2 replies, post comment_count = 3
+- When: author deletes comment 100
+- Then: comment 100 has is_deleted = true, content = null. Replies remain. comment_count stays 3.
+
+**T15: Hard delete comment with no replies**
+- Given: comment 100 has no replies, post comment_count = 1
+- When: author deletes comment 100
+- Then: comment 100 row is removed from DB. comment_count = 0.
+
+**T16: Hard delete a reply**
+- Given: comment 101 is a reply to comment 100, post comment_count = 2
+- When: author deletes comment 101
+- Then: comment 101 row removed. comment_count = 1.
+
+**T17: Delete last reply under soft-deleted parent**
+- Given: comment 100 is soft-deleted, has one remaining reply (101), comment_count = 2
+- When: author deletes reply 101
+- Then: reply 101 removed. Parent 100 is also removed (cleanup). comment_count = 0.
+
+**T18: Reply to soft-deleted comment**
+- Given: comment 100 is soft-deleted
+- When: user sends POST /api/comments {"postId": 10, "parentId": 100, "content": "Reply"}
+- Then: 400 Bad Request
+
+### 5.4 Posts
+
+**T19: View count increments on detail view**
+- Given: post 10 has view_count = 5
+- When: GET /api/posts/10
+- Then: response shows viewCount = 6
+
+**T20: Only author can edit post**
+- Given: post 10 is authored by user_1
+- When: user_2 sends PUT /api/posts/10
+- Then: 403 Forbidden
+
+**T21: Only author can delete post**
+- Given: post 10 is authored by user_1
+- When: user_2 sends DELETE /api/posts/10
+- Then: 403 Forbidden
+
+**T22: Delete post cascades all children**
+- Given: post 10 has 3 comments, 5 reactions, 2 nicknames
+- When: author deletes post 10
+- Then: post row removed. All comments, reactions, and nicknames for post 10 are removed by CASCADE.
+
+### 5.5 Pagination
+
+**T23: First page (no cursor)**
+- Given: channel 1 has 25 posts
+- When: GET /api/posts?channelId=1&size=20
+- Then: 20 posts returned (newest first), hasNext = true, nextCursor is set
+
+**T24: Second page (with cursor)**
+- Given: channel 1 has 25 posts, cursor from T23
+- When: GET /api/posts?channelId=1&size=20&cursor={nextCursor}
+- Then: 5 posts returned, hasNext = false, nextCursor is null
+
+**T25: Invalid cursor**
+- Given: any state
+- When: GET /api/posts?channelId=1&size=20&cursor=invalidgarbage
+- Then: 400 Bad Request
+
+### 5.6 Validation
+
+**T26: Missing X-User-Id header**
+- Given: any endpoint requiring auth
+- When: request sent without X-User-Id header
+- Then: 400 Bad Request
+
+**T27: Empty post title or content**
+- Given: valid channel exists
+- When: POST /api/posts {"channelId": 1, "title": "", "content": "text"}
+- Then: 400 Bad Request
