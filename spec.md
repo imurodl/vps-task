@@ -1,11 +1,11 @@
-# Spec: Seafarer Anonymous Community Board
+# Spec: 선원 익명 커뮤니티 게시판
 
-> Implementation-ready specification for S2.
-> Another developer should be able to implement this without additional questions.
+> S2의 구현 가능한 수준의 설계 명세서.
+> 다른 개발자가 추가 질문 없이 이 문서만으로 구현을 시작할 수 있어야 합니다.
 
-## 1. Data Model
+## 1. 데이터 모델
 
-### 1.1 ERD Overview
+### 1.1 ERD 개요
 
 ```
 channels 1──N posts 1──N comments
@@ -19,11 +19,11 @@ posts 1──N anonymous_nicknames
 ### 1.2 DDL
 
 ```sql
--- Enum types
+-- Enum 타입
 CREATE TYPE channel_type AS ENUM ('REAL_NAME', 'ANONYMOUS');
 CREATE TYPE reaction_type AS ENUM ('LIKE', 'DISLIKE');
 
--- Channels
+-- 채널
 CREATE TABLE channels (
     id          BIGSERIAL PRIMARY KEY,
     name        VARCHAR(100)   NOT NULL,
@@ -33,11 +33,11 @@ CREATE TABLE channels (
     updated_at  TIMESTAMPTZ    NOT NULL DEFAULT now()
 );
 
--- Posts
+-- 게시글
 CREATE TABLE posts (
     id             BIGSERIAL PRIMARY KEY,
     channel_id     BIGINT         NOT NULL REFERENCES channels(id),
-    user_id        VARCHAR(50)    NOT NULL,  -- from X-User-Id header
+    user_id        VARCHAR(50)    NOT NULL,  -- X-User-Id 헤더에서 가져옴
     title          VARCHAR(200)   NOT NULL,
     content        TEXT           NOT NULL,
     view_count     INTEGER        NOT NULL DEFAULT 0  CHECK (view_count >= 0),
@@ -51,27 +51,27 @@ CREATE TABLE posts (
 CREATE INDEX idx_posts_channel_id_created_at ON posts(channel_id, created_at DESC);
 CREATE INDEX idx_posts_user_id ON posts(user_id);
 
--- Comments
+-- 댓글
 CREATE TABLE comments (
     id             BIGSERIAL PRIMARY KEY,
     post_id        BIGINT         NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
     parent_id      BIGINT         REFERENCES comments(id) ON DELETE RESTRICT,
     user_id        VARCHAR(50)    NOT NULL,
-    content        TEXT,          -- nullable: set to NULL on soft delete
+    content        TEXT,          -- nullable: 소프트 삭제 시 NULL로 설정
     is_deleted     BOOLEAN        NOT NULL DEFAULT FALSE,
     like_count     INTEGER        NOT NULL DEFAULT 0  CHECK (like_count >= 0),
     dislike_count  INTEGER        NOT NULL DEFAULT 0  CHECK (dislike_count >= 0),
     created_at     TIMESTAMPTZ    NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ    NOT NULL DEFAULT now(),
-    -- parent_id NULL = top-level comment, non-null = reply
-    -- No-nested-reply rule (reply to reply) is enforced at application level
+    -- parent_id NULL = 최상위 댓글, non-null = 답글
+    -- 중첩 답글 금지 규칙(답글의 답글)은 애플리케이션 레벨에서 강제
 );
 
 CREATE INDEX idx_comments_post_id_created_at ON comments(post_id, created_at);
 CREATE INDEX idx_comments_parent_id ON comments(parent_id);
 
--- Anonymous Nicknames
--- Maps a user to a unique nickname within a specific post
+-- 익명 닉네임
+-- 특정 게시글 내에서 사용자를 고유 닉네임에 매핑
 CREATE TABLE anonymous_nicknames (
     id          BIGSERIAL PRIMARY KEY,
     post_id     BIGINT         NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
@@ -83,7 +83,7 @@ CREATE TABLE anonymous_nicknames (
     CONSTRAINT uq_nickname_post UNIQUE (post_id, nickname)
 );
 
--- Post Reactions
+-- 게시글 반응
 CREATE TABLE post_reactions (
     id          BIGSERIAL PRIMARY KEY,
     post_id     BIGINT         NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
@@ -94,7 +94,7 @@ CREATE TABLE post_reactions (
     CONSTRAINT uq_post_reaction_user UNIQUE (post_id, user_id)
 );
 
--- Comment Reactions
+-- 댓글 반응
 CREATE TABLE comment_reactions (
     id          BIGSERIAL PRIMARY KEY,
     comment_id  BIGINT         NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
@@ -106,49 +106,49 @@ CREATE TABLE comment_reactions (
 );
 ```
 
-### 1.3 Key Design Notes
+### 1.3 주요 설계 노트
 
-- **user_id is VARCHAR(50)**, not a FK to a users table — auth is out of scope, we just store the raw header value
-- **Denormalized counts** (`like_count`, `dislike_count`, `comment_count`, `view_count`) on posts and comments for fast read performance. Updated within the same transaction as the write operation.
-- **anonymous_nicknames has two unique constraints**: `(post_id, user_id)` ensures one nickname per user per post; `(post_id, nickname)` ensures no two users get the same nickname in the same post
-- **Soft delete** on comments uses `is_deleted` flag — content is replaced but row is preserved for reply thread structure
-- **ON DELETE CASCADE** on post_id FKs — when a post is deleted, all comments, reactions, and nicknames are cleaned up by the DB
-- **parent_id ON DELETE RESTRICT** — the DB blocks deletion of a comment that has replies. The app must soft-delete (set `is_deleted = true`, replace content) when replies exist, and may only hard-delete when there are no replies. RESTRICT ensures a bug in app logic surfaces as an error rather than silently destroying user content.
-- **`updated_at` is set by the application**, not a DB trigger — every UPDATE statement on channels, posts, and comments must explicitly include `SET updated_at = now()`. A DB trigger (`BEFORE UPDATE`) is an alternative, but explicit application-level control is preferred for transparency and testability.
-- **No `updated_at` on reaction tables** — reactions are created, switched, or deleted. Tracking when a reaction type changed has no business value.
-- **No-nested-reply rule** is enforced at app level: before inserting a comment with `parent_id`, check that the parent's own `parent_id` is NULL
+- **user_id는 VARCHAR(50)** — users 테이블에 대한 FK가 아님. 인증/인가는 범위 밖이므로 헤더 값을 그대로 저장
+- **비정규화된 카운트** (`like_count`, `dislike_count`, `comment_count`, `view_count`)를 posts와 comments에 저장하여 빠른 읽기 성능 확보. 쓰기 작업과 같은 트랜잭션 내에서 업데이트
+- **anonymous_nicknames에 두 개의 유니크 제약조건**: `(post_id, user_id)`는 게시글당 사용자당 하나의 닉네임 보장; `(post_id, nickname)`은 같은 게시글에서 두 사용자가 같은 닉네임을 받지 않도록 보장
+- **소프트 삭제** — comments에 `is_deleted` 플래그 사용. 내용은 대체되지만 답글 스레드 구조를 위해 행은 보존
+- **post_id FK에 ON DELETE CASCADE** — 게시글 삭제 시 모든 댓글, 반응, 닉네임이 DB에 의해 자동 정리
+- **parent_id에 ON DELETE RESTRICT** — 답글이 있는 댓글의 삭제를 DB가 차단. 앱은 답글이 있으면 소프트 삭제(`is_deleted = true`, 내용 대체)해야 하며, 답글이 없을 때만 하드 삭제 가능. RESTRICT는 앱 로직의 버그가 조용히 사용자 콘텐츠를 파괴하는 대신 에러로 표면화되도록 보장
+- **`updated_at`는 애플리케이션에서 설정** — DB 트리거가 아님. channels, posts, comments에 대한 모든 UPDATE 문은 명시적으로 `SET updated_at = now()`를 포함해야 합니다. DB 트리거(`BEFORE UPDATE`)가 대안이지만, 투명성과 테스트 용이성을 위해 애플리케이션 레벨 제어를 선호
+- **반응 테이블에는 `updated_at` 없음** — 반응은 생성, 전환, 삭제됩니다. 반응 타입이 언제 변경되었는지 추적하는 것은 비즈니스 가치가 없음
+- **중첩 답글 금지 규칙**은 앱 레벨에서 강제: `parent_id`가 있는 댓글을 삽입하기 전에 부모의 `parent_id`가 NULL인지 확인
 
-## 2. API Design
+## 2. API 설계
 
-Base path: `/api`
-Auth: `X-User-Id` request header (e.g., `user_1`)
+기본 경로: `/api`
+인증: `X-User-Id` 요청 헤더 (예: `user_1`)
 Content-Type: `application/json`
 
-### 2.1 Channels
+### 2.1 채널
 
-#### Create Channel
+#### 채널 생성
 
 ```
 POST /api/channels
 
 Request:
 {
-  "name": "Ship Reviews",
-  "description": "Share your experience",    // optional
-  "type": "ANONYMOUS"                         // REAL_NAME | ANONYMOUS
+  "name": "선박 리뷰",
+  "description": "경험을 공유하세요",    // 선택사항
+  "type": "ANONYMOUS"                    // REAL_NAME | ANONYMOUS
 }
 
 Response: 201 Created
 {
   "id": 1,
-  "name": "Ship Reviews",
-  "description": "Share your experience",
+  "name": "선박 리뷰",
+  "description": "경험을 공유하세요",
   "type": "ANONYMOUS",
   "createdAt": "2026-04-01T12:00:00Z"
 }
 ```
 
-#### List Channels
+#### 채널 목록 조회
 
 ```
 GET /api/channels
@@ -158,8 +158,8 @@ Response: 200 OK
   "data": [
     {
       "id": 1,
-      "name": "Ship Reviews",
-      "description": "Share your experience",
+      "name": "선박 리뷰",
+      "description": "경험을 공유하세요",
       "type": "ANONYMOUS",
       "createdAt": "2026-04-01T12:00:00Z"
     }
@@ -167,9 +167,9 @@ Response: 200 OK
 }
 ```
 
-### 2.2 Posts
+### 2.2 게시글
 
-#### Create Post
+#### 게시글 작성
 
 ```
 POST /api/posts
@@ -178,8 +178,8 @@ X-User-Id: user_1
 Request:
 {
   "channelId": 1,
-  "title": "My experience on MV Pacific",
-  "content": "Great working conditions..."
+  "title": "MV Pacific 승선 경험",
+  "content": "근무 환경이 좋았습니다..."
 }
 
 Response: 201 Created
@@ -187,11 +187,11 @@ Response: 201 Created
   "id": 10,
   "channelId": 1,
   "author": {
-    "userId": "user_1",           // REAL_NAME channel only, null in ANONYMOUS
-    "nickname": "Brave Whale"     // ANONYMOUS channel only, null in REAL_NAME
+    "userId": "user_1",           // REAL_NAME 채널에서만 표시, ANONYMOUS에서는 null
+    "nickname": "용감한 고래"      // ANONYMOUS 채널에서만 표시, REAL_NAME에서는 null
   },
-  "title": "My experience on MV Pacific",
-  "content": "Great working conditions...",
+  "title": "MV Pacific 승선 경험",
+  "content": "근무 환경이 좋았습니다...",
   "viewCount": 0,
   "likeCount": 0,
   "dislikeCount": 0,
@@ -201,7 +201,7 @@ Response: 201 Created
 }
 ```
 
-#### List Posts (cursor-based pagination)
+#### 게시글 목록 조회 (커서 기반 페이지네이션)
 
 ```
 GET /api/posts?channelId=1&size=20&cursor={encodedCursor}
@@ -213,10 +213,10 @@ Response: 200 OK
       "id": 10,
       "channelId": 1,
       "author": {
-        "nickname": "Brave Whale"       // anonymous channel
+        "nickname": "용감한 고래"       // 익명 채널
       },
-      "title": "My experience on MV Pacific",
-      "content": "Great working conditions...",
+      "title": "MV Pacific 승선 경험",
+      "content": "근무 환경이 좋았습니다...",
       "viewCount": 42,
       "likeCount": 5,
       "dislikeCount": 1,
@@ -229,7 +229,7 @@ Response: 200 OK
 }
 ```
 
-Cursor encodes `(createdAt, id)` of the last item. Query uses a LEFT JOIN to fetch anonymous nicknames in a single query (avoids N+1):
+커서는 마지막 항목의 `(createdAt, id)`를 인코딩합니다. 쿼리는 LEFT JOIN으로 익명 닉네임을 단일 쿼리로 조회합니다 (N+1 방지):
 
 ```sql
 SELECT p.*, an.nickname
@@ -241,11 +241,11 @@ ORDER BY p.created_at DESC, p.id DESC
 LIMIT :size
 ```
 
-In REAL_NAME channels, the JOIN produces NULL for nickname — the app returns `author.userId` instead.
+REAL_NAME 채널에서는 JOIN이 nickname에 대해 NULL을 반환합니다 — 앱은 대신 `author.userId`를 반환합니다.
 
-#### Get Post Detail
+#### 게시글 상세 조회
 
-```
+````
 GET /api/posts/{postId}
 X-User-Id: user_1
 
@@ -254,166 +254,176 @@ Response: 200 OK
   "id": 10,
   "channelId": 1,
   "author": {
-    "nickname": "Brave Whale"
+    "nickname": "용감한 고래"
   },
-  "title": "My experience on MV Pacific",
-  "content": "Great working conditions...",
-  "viewCount": 43,            // incremented
+  "title": "MV Pacific 승선 경험",
+  "content": "근무 환경이 좋았습니다...",
+  "viewCount": 43,            // 증가됨
   "likeCount": 5,
   "dislikeCount": 1,
   "commentCount": 3,
-  "myReaction": "LIKE",       // current user's reaction, null if none
+  "myReaction": "LIKE",       // 현재 사용자의 반응, 없으면 null
   "createdAt": "2026-04-01T12:00:00Z",
   "updatedAt": "2026-04-01T12:00:00Z"
 }
 
-Query fetches the post with nickname and current user's reaction in one query:
+닉네임과 현재 사용자의 반응을 단일 쿼리로 조회:
 ```sql
 SELECT p.*, an.nickname, pr.type AS my_reaction
 FROM posts p
 LEFT JOIN anonymous_nicknames an ON an.post_id = p.id AND an.user_id = p.user_id
 LEFT JOIN post_reactions pr ON pr.post_id = p.id AND pr.user_id = :currentUserId
 WHERE p.id = :postId
-```
-```
-
-#### Update Post
+````
 
 ```
+
+#### 게시글 수정
+
+```
+
 PUT /api/posts/{postId}
 X-User-Id: user_1
 
 Request:
 {
-  "title": "Updated title",         // optional
-  "content": "Updated content"       // optional
+"title": "수정된 제목", // 선택사항
+"content": "수정된 내용" // 선택사항
 }
 
 Response: 200 OK
-{ ...updated post object... }
+{ ...수정된 게시글 객체... }
 
-Behavior:
-  - Only provided fields are updated (partial update)
-  - updated_at is set to now() on every update
+동작:
 
-Errors:
-  403 Forbidden — X-User-Id does not match post author
-  404 Not Found — post does not exist
-```
+- 제공된 필드만 업데이트 (부분 업데이트)
+- 매 업데이트마다 updated_at을 now()로 설정
 
-#### Delete Post
+에러:
+403 Forbidden — X-User-Id가 게시글 작성자와 불일치
+404 Not Found — 게시글이 존재하지 않음
 
 ```
+
+#### 게시글 삭제
+
+```
+
 DELETE /api/posts/{postId}
 X-User-Id: user_1
 
 Response: 204 No Content
 
-Errors:
-  403 Forbidden — not the author
-  404 Not Found
-```
-
-### 2.3 Comments
-
-#### Create Comment
+에러:
+403 Forbidden — 작성자가 아님
+404 Not Found
 
 ```
+
+### 2.3 댓글
+
+#### 댓글 작성
+
+```
+
 POST /api/comments
 X-User-Id: user_1
 
 Request:
 {
-  "postId": 10,
-  "parentId": null,            // null = top-level comment, non-null = reply
-  "content": "I agree with this"
+"postId": 10,
+"parentId": null, // null = 최상위 댓글, non-null = 답글
+"content": "저도 동의합니다"
 }
 
 Response: 201 Created
 {
-  "id": 100,
-  "postId": 10,
-  "parentId": null,
-  "author": {
-    "nickname": "Brave Whale"     // same nickname as their post in this thread
-  },
-  "content": "I agree with this",
-  "likeCount": 0,
-  "dislikeCount": 0,
-  "isDeleted": false,
-  "createdAt": "2026-04-01T12:30:00Z"
+"id": 100,
+"postId": 10,
+"parentId": null,
+"author": {
+"nickname": "용감한 고래" // 이 스레드에서의 게시글과 같은 닉네임
+},
+"content": "저도 동의합니다",
+"likeCount": 0,
+"dislikeCount": 0,
+"isDeleted": false,
+"createdAt": "2026-04-01T12:30:00Z"
 }
 
-Errors:
-  400 Bad Request — parentId refers to a reply (nested reply not allowed)
-  404 Not Found — postId or parentId does not exist
-```
-
-#### List Comments for a Post (cursor-based, top-level only)
+에러:
+400 Bad Request — parentId가 답글을 참조 (중첩 답글 불가)
+404 Not Found — postId 또는 parentId가 존재하지 않음
 
 ```
+
+#### 게시글의 댓글 목록 조회 (커서 기반, 최상위만)
+
+```
+
 GET /api/comments?postId=10&size=20&cursor={encodedCursor}
 
 Response: 200 OK
 {
-  "data": [
-    {
-      "id": 100,
-      "postId": 10,
-      "parentId": null,
-      "author": {
-        "nickname": "Brave Whale"
-      },
-      "content": "I agree with this",
-      "likeCount": 2,
-      "dislikeCount": 0,
-      "isDeleted": false,
-      "myReaction": null,
-      "createdAt": "2026-04-01T12:30:00Z",
-      "replies": [
-        {
-          "id": 101,
-          "postId": 10,
-          "parentId": 100,
-          "author": {
-            "nickname": "Quiet Dolphin"
-          },
-          "content": "Me too!",
-          "likeCount": 0,
-          "dislikeCount": 0,
-          "isDeleted": false,
-          "myReaction": "LIKE",
-          "createdAt": "2026-04-01T12:35:00Z"
-        }
-      ]
-    },
-    {
-      "id": 102,
-      "postId": 10,
-      "parentId": null,
-      "author": {
-        "nickname": "Silent Shark"
-      },
-      "content": null,                          // soft-deleted
-      "isDeleted": true,
-      "likeCount": 0,
-      "dislikeCount": 0,
-      "myReaction": null,
-      "createdAt": "2026-04-01T13:00:00Z",
-      "replies": [
-        {
-          "id": 103,
-          ...
-        }
-      ]
-    }
-  ]
+"data": [
+{
+"id": 100,
+"postId": 10,
+"parentId": null,
+"author": {
+"nickname": "용감한 고래"
+},
+"content": "저도 동의합니다",
+"likeCount": 2,
+"dislikeCount": 0,
+"isDeleted": false,
+"myReaction": null,
+"createdAt": "2026-04-01T12:30:00Z",
+"replies": [
+{
+"id": 101,
+"postId": 10,
+"parentId": 100,
+"author": {
+"nickname": "조용한 돌고래"
+},
+"content": "저도요!",
+"likeCount": 0,
+"dislikeCount": 0,
+"isDeleted": false,
+"myReaction": "LIKE",
+"createdAt": "2026-04-01T12:35:00Z"
 }
-```
+]
+},
+{
+"id": 102,
+"postId": 10,
+"parentId": null,
+"author": {
+"nickname": "고요한 상어"
+},
+"content": null, // 소프트 삭제됨
+"isDeleted": true,
+"likeCount": 0,
+"dislikeCount": 0,
+"myReaction": null,
+"createdAt": "2026-04-01T13:00:00Z",
+"replies": [
+{
+"id": 103,
+...
+}
+]
+}
+]
+}
 
-Top-level comments are cursor-paginated (sorted by `created_at ASC`). Each top-level comment includes all its replies inline (replies are not separately paginated — max depth is 1, so reply counts per comment stay manageable).
+````
 
-Query fetches all comments for the post (both top-level and replies) in one query, with nicknames and the current user's reaction:
+최상위 댓글은 커서 기반으로 페이지네이션됩니다 (`created_at ASC` 정렬). 각 최상위 댓글은 답글을 인라인으로 포함합니다 (답글은 별도로 페이지네이션되지 않음 — 최대 깊이가 1이므로 댓글당 답글 수가 관리 가능한 수준).
+
+게시글의 모든 댓글(최상위 및 답글)을 닉네임과 현재 사용자의 반응과 함께 조회하는 쿼리:
 ```sql
 SELECT c.*, an.nickname, cr.type AS my_reaction
 FROM comments c
@@ -421,14 +431,15 @@ LEFT JOIN anonymous_nicknames an ON an.post_id = c.post_id AND an.user_id = c.us
 LEFT JOIN comment_reactions cr ON cr.comment_id = c.id AND cr.user_id = :currentUserId
 WHERE c.post_id = :postId
   AND (
-    -- top-level comments within cursor window
+    -- 커서 윈도우 내의 최상위 댓글
     (c.parent_id IS NULL AND (c.created_at, c.id) > (:cursorCreatedAt, :cursorId))
-    -- or replies belonging to those top-level comments
+    -- 또는 해당 최상위 댓글에 속하는 답글
     OR c.parent_id IN (:topLevelCommentIds)
   )
 ORDER BY c.parent_id NULLS FIRST, c.created_at ASC
-```
-This is executed as two queries in practice: first fetch the paginated top-level comments (with JOINs), then fetch all replies for those top-level IDs (with JOINs). The app groups replies under their parent in memory.
+````
+
+실제로는 두 개의 쿼리로 실행됩니다: 먼저 페이지네이션된 최상위 댓글을 (JOIN과 함께) 조회하고, 그 최상위 ID들에 대한 모든 답글을 (JOIN과 함께) 조회합니다. 앱이 메모리에서 답글을 부모 아래에 그룹화합니다.
 
 ```
   "nextCursor": "eyJjcmVhdGVkQXQiOi4uLiwiaWQiOjEwMn0=",
@@ -436,7 +447,7 @@ This is executed as two queries in practice: first fetch the paginated top-level
 }
 ```
 
-#### Update Comment
+#### 댓글 수정
 
 ```
 PUT /api/comments/{commentId}
@@ -444,22 +455,22 @@ X-User-Id: user_1
 
 Request:
 {
-  "content": "Updated comment"
+  "content": "수정된 댓글"
 }
 
 Response: 200 OK
-{ ...updated comment object... }
+{ ...수정된 댓글 객체... }
 
-Behavior:
-  - updated_at is set to now() on every update
+동작:
+  - 매 업데이트마다 updated_at을 now()로 설정
 
-Errors:
-  403 Forbidden — not the author
+에러:
+  403 Forbidden — 작성자가 아님
   404 Not Found
-  400 Bad Request — comment is already deleted
+  400 Bad Request — 댓글이 이미 삭제됨
 ```
 
-#### Delete Comment
+#### 댓글 삭제
 
 ```
 DELETE /api/comments/{commentId}
@@ -467,19 +478,19 @@ X-User-Id: user_1
 
 Response: 204 No Content
 
-Behavior:
-  - If comment has replies → soft delete (is_deleted = true, content = null)
-  - If comment has no replies → hard delete (remove row)
-  - If comment is a reply → hard delete (remove row)
+동작:
+  - 답글이 있는 댓글 → 소프트 삭제 (is_deleted = true, content = null)
+  - 답글이 없는 댓글 → 하드 삭제 (행 제거)
+  - 답글인 경우 → 하드 삭제 (행 제거)
 
-Errors:
-  403 Forbidden — not the author
+에러:
+  403 Forbidden — 작성자가 아님
   404 Not Found
 ```
 
-### 2.4 Reactions
+### 2.4 반응
 
-#### Toggle Post Reaction
+#### 게시글 반응 토글
 
 ```
 POST /api/posts/{postId}/reactions
@@ -493,18 +504,18 @@ Request:
 Response: 200 OK
 {
   "action": "ADDED",         // ADDED | SWITCHED | CANCELLED
-  "type": "LIKE",            // current reaction type, null if cancelled
-  "likeCount": 6,            // updated counts
+  "type": "LIKE",            // 현재 반응 타입, 취소 시 null
+  "likeCount": 6,            // 업데이트된 카운트
   "dislikeCount": 1
 }
 
-Logic:
-  - No existing reaction      → INSERT, action = ADDED
-  - Same type exists           → DELETE, action = CANCELLED
-  - Different type exists      → UPDATE, action = SWITCHED
+로직:
+  - 기존 반응 없음            → INSERT, action = ADDED
+  - 같은 타입 존재            → DELETE, action = CANCELLED
+  - 다른 타입 존재            → UPDATE, action = SWITCHED
 ```
 
-#### Toggle Comment Reaction
+#### 댓글 반응 토글
 
 ```
 POST /api/comments/{commentId}/reactions
@@ -524,46 +535,46 @@ Response: 200 OK
 }
 ```
 
-### 2.5 Common Error Response Format
+### 2.5 공통 에러 응답 형식
 
 ```json
 {
   "error": {
     "code": "FORBIDDEN",
-    "message": "You are not the author of this post"
+    "message": "이 게시글의 작성자가 아닙니다"
   }
 }
 ```
 
-Standard HTTP status codes:
+표준 HTTP 상태 코드:
 
-- `400` — Bad request (validation error, nested reply attempt)
-- `403` — Not the author
-- `404` — Resource not found
-- `500` — Internal server error
+- `400` — 잘못된 요청 (유효성 검증 오류, 중첩 답글 시도)
+- `403` — 작성자가 아님
+- `404` — 리소스를 찾을 수 없음
+- `500` — 내부 서버 오류
 
-## 3. Core Business Logic
+## 3. 핵심 비즈니스 로직
 
-### 3.1 Anonymous Nickname Generation
+### 3.1 익명 닉네임 생성
 
-**When triggered:** Any time a user creates a post or comment in an ANONYMOUS channel.
+**트리거 시점:** 사용자가 ANONYMOUS 채널에서 게시글 또는 댓글을 작성할 때마다.
 
-**Nickname format:** `{Adjective} {SeaCreature}` — e.g., "Brave Whale", "Quiet Dolphin", "Silent Shark"
+**닉네임 형식:** `{형용사} {해양생물}` — 예: "용감한 고래", "조용한 돌고래", "고요한 상어"
 
-- Adjective pool: ~50 words (brave, quiet, silent, swift, bold, calm, ...)
-- Noun pool: ~50 sea creatures (whale, dolphin, shark, octopus, turtle, ...)
-- Total combinations: ~2,500 — sufficient for any single post's participants
+- 형용사 풀: ~50개 단어 (용감한, 조용한, 고요한, 빠른, 대담한, 차분한, ...)
+- 명사 풀: ~50개 해양 생물 (고래, 돌고래, 상어, 문어, 거북이, ...)
+- 총 조합: ~2,500개 — 단일 게시글의 참여자 수로 충분
 
-**Algorithm:**
+**알고리즘:**
 
 ```
 function getOrCreateNickname(postId, userId):
     MAX_RETRIES = 3
 
     for attempt in 1..MAX_RETRIES:
-        nickname = generateRandomNickname()   // random adjective + noun
+        nickname = generateRandomNickname()   // 무작위 형용사 + 명사
         if attempt == MAX_RETRIES:
-            nickname = nickname + " " + randomInt(1, 9999)  // fallback: append number
+            nickname = nickname + " " + randomInt(1, 9999)  // 폴백: 숫자 추가
 
         try:
             result = INSERT INTO anonymous_nicknames (post_id, user_id, nickname)
@@ -571,125 +582,125 @@ function getOrCreateNickname(postId, userId):
                      ON CONFLICT (post_id, user_id) DO NOTHING
 
             if result.rowsAffected == 0:
-                // User already has a nickname for this post
+                // 이 게시글에 대해 사용자가 이미 닉네임을 보유
                 return SELECT nickname FROM anonymous_nicknames
                        WHERE post_id = :postId AND user_id = :userId
 
-            // Insert succeeded — return the new nickname
+            // 삽입 성공 — 새 닉네임 반환
             return nickname
 
         catch UNIQUE_VIOLATION on (post_id, nickname):
-            // Another user got the same nickname for this post — retry
+            // 다른 사용자가 이 게시글에서 같은 닉네임을 받음 — 재시도
             continue
 
-    // Should not reach here (fallback with number is near-guaranteed unique)
+    // 여기에 도달하지 않아야 함 (숫자가 추가된 폴백은 거의 확실히 유일)
 ```
 
-**Concurrency safety:**
+**동시성 안전성:**
 
-- `UNIQUE(post_id, user_id)` — prevents a user from getting two nicknames per post
-- `UNIQUE(post_id, nickname)` — prevents two users from getting the same nickname per post
-- Both constraints are enforced by the DB, not app logic
-- Pattern: **optimistic concurrency** — try the write, let the DB reject conflicts, handle gracefully
+- `UNIQUE(post_id, user_id)` — 한 사용자가 같은 게시글에서 두 개의 닉네임을 받는 것을 방지
+- `UNIQUE(post_id, nickname)` — 게시글당 두 사용자가 같은 닉네임을 받는 것을 방지
+- 두 제약조건 모두 앱 로직이 아닌 DB에 의해 강제
+- 패턴: **낙관적 동시성** — 쓰기를 시도하고, DB가 충돌을 거부하면, 적절히 처리
 
-**In REAL_NAME channels:** Skip nickname logic entirely. Return the user_id as the author identity.
+**REAL_NAME 채널에서:** 닉네임 로직을 완전히 건너뜁니다. user_id를 작성자 식별자로 반환합니다.
 
-### 3.2 Reaction Toggle
+### 3.2 반응 토글
 
-**When triggered:** `POST /api/posts/{postId}/reactions` or `POST /api/comments/{commentId}/reactions`
+**트리거 시점:** `POST /api/posts/{postId}/reactions` 또는 `POST /api/comments/{commentId}/reactions`
 
-**Algorithm (same logic for both posts and comments):**
+**알고리즘 (게시글과 댓글에 동일한 로직):**
 
 ```
 @Transactional
 function toggleReaction(targetId, userId, newType):
 
-    // Step 1: Check for existing reaction
+    // Step 1: 기존 반응 확인
     existing = SELECT * FROM post_reactions
                WHERE post_id = :targetId AND user_id = :userId
 
-    // Step 2: No existing reaction → ADD
+    // Step 2: 기존 반응 없음 → 추가
     if existing == null:
         INSERT INTO post_reactions (post_id, user_id, type) VALUES (...)
-        UPDATE posts SET like_count = like_count + 1   // or dislike_count
+        UPDATE posts SET like_count = like_count + 1   // 또는 dislike_count
             WHERE id = :targetId
         return { action: "ADDED", type: newType }
 
-    // Step 3: Same type → CANCEL (remove reaction)
+    // Step 3: 같은 타입 → 취소 (반응 제거)
     if existing.type == newType:
         DELETE FROM post_reactions WHERE id = existing.id
-        UPDATE posts SET like_count = like_count - 1   // or dislike_count
+        UPDATE posts SET like_count = like_count - 1   // 또는 dislike_count
             WHERE id = :targetId
         return { action: "CANCELLED", type: null }
 
-    // Step 4: Different type → SWITCH
+    // Step 4: 다른 타입 → 전환
     UPDATE post_reactions SET type = :newType WHERE id = existing.id
-    UPDATE posts SET like_count = like_count + 1,      // increment new
-                     dislike_count = dislike_count - 1  // decrement old
+    UPDATE posts SET like_count = like_count + 1,      // 새 타입 증가
+                     dislike_count = dislike_count - 1  // 이전 타입 감소
         WHERE id = :targetId
     return { action: "SWITCHED", type: newType }
 ```
 
-**Concurrency safety:**
+**동시성 안전성:**
 
-- `UNIQUE(post_id, user_id)` prevents duplicate reactions at the DB level
-- If a double-click causes two concurrent requests:
-  - Request A: SELECT → null, INSERT → success
-  - Request B: SELECT → null, INSERT → unique constraint violation
-  - Catch the violation, re-SELECT, re-run toggle logic (now it sees the reaction from A and cancels it, which is correct behavior)
-- Denormalized counts are updated within the same `@Transactional` — atomic with the reaction change
+- `UNIQUE(post_id, user_id)`가 DB 레벨에서 중복 반응을 방지
+- 더블클릭으로 두 개의 동시 요청이 발생하면:
+  - 요청 A: SELECT → null, INSERT → 성공
+  - 요청 B: SELECT → null, INSERT → 유니크 제약조건 위반
+  - 위반을 캐치하고, 다시 SELECT, 토글 로직 재실행 (이제 A의 반응을 보고 취소 — 올바른 동작)
+- 비정규화된 카운트는 같은 `@Transactional` 내에서 업데이트 — 반응 변경과 원자적
 
-**Count safety:** Counts can never go below 0 — enforced by `CHECK (>= 0)` constraints on the count columns (defined in DDL, section 1.2). A bug that over-decrements will throw a constraint violation instead of producing negative counts.
+**카운트 안전성:** 카운트는 절대 0 미만이 될 수 없음 — 카운트 컬럼의 `CHECK (>= 0)` 제약조건으로 강제 (DDL, 섹션 1.2에서 정의). 과도한 감소 버그는 음수를 생성하는 대신 제약조건 위반을 발생시킵니다.
 
-### 3.3 Comment Soft Delete
+### 3.3 댓글 소프트 삭제
 
-**When triggered:** `DELETE /api/comments/{commentId}`
+**트리거 시점:** `DELETE /api/comments/{commentId}`
 
-**Algorithm:**
+**알고리즘:**
 
 ```
 @Transactional
 function deleteComment(commentId, userId):
 
-    // Step 1: Load the comment
+    // Step 1: 댓글 로드
     comment = SELECT * FROM comments WHERE id = :commentId
     if comment == null: return 404
     if comment.user_id != userId: return 403
-    if comment.is_deleted: return 404   // already deleted
+    if comment.is_deleted: return 404   // 이미 삭제됨
 
-    // Step 2: Is this a reply? (has parent_id)
+    // Step 2: 답글인가? (parent_id가 있는지)
     if comment.parent_id != null:
-        // Replies are always hard-deleted
+        // 답글은 항상 하드 삭제
         DELETE FROM comments WHERE id = :commentId
         UPDATE posts SET comment_count = comment_count - 1
             WHERE id = comment.post_id
-        cleanupParentIfNeeded(comment.parent_id)   // remove parent too if soft-deleted with no remaining replies
+        cleanupParentIfNeeded(comment.parent_id)   // 소프트 삭제된 부모에 남은 답글이 없으면 부모도 제거
         return 204
 
-    // Step 3: Top-level comment — check for replies
+    // Step 3: 최상위 댓글 — 답글 확인
     replyCount = SELECT COUNT(*) FROM comments
                  WHERE parent_id = :commentId AND is_deleted = FALSE
 
     if replyCount == 0:
-        // No active replies — hard delete
-        // (also hard-delete any soft-deleted replies first)
+        // 활성 답글 없음 — 하드 삭제
+        // (소프트 삭제된 답글도 먼저 하드 삭제)
         DELETE FROM comments WHERE parent_id = :commentId
         DELETE FROM comments WHERE id = :commentId
         UPDATE posts SET comment_count = comment_count - 1
             WHERE id = comment.post_id
         return 204
     else:
-        // Has active replies — soft delete
+        // 활성 답글 있음 — 소프트 삭제
         UPDATE comments SET is_deleted = TRUE, content = NULL, updated_at = now()
             WHERE id = :commentId
-        // Do NOT decrement comment_count (placeholder is still visible)
+        // comment_count를 감소시키지 않음 (플레이스홀더가 여전히 표시됨)
         return 204
 ```
 
-**Cleanup opportunity:** When the last reply under a soft-deleted parent is deleted, the parent can be fully removed:
+**정리 기회:** 소프트 삭제된 부모 아래의 마지막 답글이 삭제되면, 부모도 완전히 제거할 수 있습니다:
 
 ```
-// After hard-deleting a reply, check if parent should be cleaned up
+// 답글을 하드 삭제한 후, 부모를 정리해야 하는지 확인
 function cleanupParentIfNeeded(parentId):
     parent = SELECT * FROM comments WHERE id = :parentId
     if parent.is_deleted:
@@ -700,216 +711,216 @@ function cleanupParentIfNeeded(parentId):
                 WHERE id = parent.post_id
 ```
 
-### 3.4 View Count
+### 3.4 조회수
 
-**When triggered:** `GET /api/posts/{postId}` (post detail view)
+**트리거 시점:** `GET /api/posts/{postId}` (게시글 상세 조회)
 
-**Algorithm:**
+**알고리즘:**
 
 ```sql
 UPDATE posts SET view_count = view_count + 1 WHERE id = :postId
 ```
 
-**Design decision — raw count, not unique views:**
+**설계 결정 — 누적 카운트, 고유 조회수 아님:**
 
-- We don't track which users viewed which posts
-- Every detail view request increments the counter
-- Unique view tracking would require a `post_views` table (post_id, user_id, viewed_at), adding write overhead to every read operation
-- For a seafarer community, raw count is sufficient and much simpler
-- This is an ambiguous requirement — documented in decisions.md
+- 어떤 사용자가 어떤 게시글을 봤는지 추적하지 않음
+- 모든 상세 조회 요청마다 카운터 증가
+- 고유 조회 추적은 `post_views` 테이블 (post_id, user_id, viewed_at)이 필요하며, 모든 읽기 작업에 쓰기 오버헤드를 추가
+- 선원 커뮤니티에서는 누적 카운트로 충분하며 훨씬 간단
+- 이것은 모호한 요구사항 — decisions.md에 문서화
 
-## 4. Edge Cases
+## 4. 엣지 케이스
 
-| #   | Scenario                                              | Handling                                                                                                                                                                                        |
-| --- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Missing or empty X-User-Id header**                 | Return 400 Bad Request. All endpoints require user identification.                                                                                                                              |
-| 2   | **Post/comment in non-existent channel or post**      | Return 404 Not Found. Validate FK existence before insert.                                                                                                                                      |
-| 3   | **React to a soft-deleted comment**                   | Return 400 Bad Request. Deleted comments cannot receive new reactions.                                                                                                                          |
-| 4   | **Edit a soft-deleted comment**                       | Return 400 Bad Request. Once soft-deleted, content cannot be restored.                                                                                                                          |
-| 5   | **Reply to a soft-deleted comment**                   | Return 400 Bad Request. Cannot start a conversation under a deleted comment.                                                                                                                    |
-| 6   | **Delete a post with comments, reactions, nicknames** | CASCADE handles cleanup. All child rows (comments, reactions, nicknames) are automatically removed by the DB.                                                                                   |
-| 7   | **Empty or blank title/content**                      | Return 400 Bad Request. Reject whitespace-only strings. Validate at app level before DB insert.                                                                                                 |
-| 8   | **Nickname pool exhaustion**                          | On the final retry (attempt 3), a random number is appended to the nickname (e.g., "Brave Whale 42"). This guarantees uniqueness beyond the 2,500 base combinations. The user's action always succeeds — nickname generation never fails. |
-| 9   | **User reacts to their own post/comment**             | Allowed. No restriction — same behavior as reacting to anyone else's content.                                                                                                                   |
-| 10  | **Invalid or tampered cursor parameter**              | Return 400 Bad Request with "invalid cursor" message. Decode in try-catch, reject malformed values.                                                                                             |
-| 11  | **Update post in anonymous channel**                  | Nickname stays the same. It's tied to (post_id, user_id), not the content. Editing content does not regenerate or change the nickname.                                                          |
-| 12  | **Concurrent post creation in anonymous channel**     | Two users create posts simultaneously. Each gets their own nickname via the INSERT ON CONFLICT pattern. No conflict possible — different user_ids.                                              |
-| 13  | **Delete the only reply under a soft-deleted parent** | Hard-delete the reply, then clean up the parent: since parent is soft-deleted and now has zero replies, hard-delete the parent too. Decrement comment_count for both.                           |
-| 14  | **React to a non-existent post/comment**              | Return 404 Not Found.                                                                                                                                                                           |
-| 15  | **Nested reply attempt (reply to a reply)**           | Return 400 Bad Request. App checks that `parent.parent_id IS NULL` before inserting.                                                                                                            |
+| #   | 시나리오                                       | 처리 방법                                                                                                                                                                                   |
+| --- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **X-User-Id 헤더 누락 또는 비어있음**          | 400 Bad Request 반환. 모든 엔드포인트는 사용자 식별이 필요.                                                                                                                                 |
+| 2   | **존재하지 않는 채널 또는 게시글에 작성**      | 404 Not Found 반환. INSERT 전에 FK 존재 여부 검증.                                                                                                                                          |
+| 3   | **소프트 삭제된 댓글에 반응**                  | 400 Bad Request 반환. 삭제된 댓글은 새 반응을 받을 수 없음.                                                                                                                                 |
+| 4   | **소프트 삭제된 댓글 수정**                    | 400 Bad Request 반환. 소프트 삭제 후 내용을 복원할 수 없음.                                                                                                                                 |
+| 5   | **소프트 삭제된 댓글에 답글**                  | 400 Bad Request 반환. 삭제된 댓글 아래에서 대화를 시작할 수 없음.                                                                                                                           |
+| 6   | **댓글, 반응, 닉네임이 있는 게시글 삭제**      | CASCADE가 정리를 처리. 모든 하위 행(댓글, 반응, 닉네임)이 DB에 의해 자동 제거.                                                                                                              |
+| 7   | **비어있거나 공백만 있는 제목/내용**           | 400 Bad Request 반환. 공백만 있는 문자열 거부. DB INSERT 전에 앱 레벨에서 검증.                                                                                                             |
+| 8   | **닉네임 풀 소진**                             | 마지막 재시도(3번째 시도)에서 닉네임에 무작위 숫자를 추가 (예: "용감한 고래 42"). 2,500개 기본 조합을 넘어서는 유일성을 보장. 사용자의 액션은 항상 성공 — 닉네임 생성이 절대 실패하지 않음. |
+| 9   | **자신의 게시글/댓글에 반응**                  | 허용. 제한 없음 — 다른 사람의 콘텐츠에 반응하는 것과 같은 동작.                                                                                                                             |
+| 10  | **유효하지 않거나 변조된 커서 파라미터**       | 400 Bad Request 반환, "invalid cursor" 메시지. try-catch에서 디코딩, 잘못된 값 거부.                                                                                                        |
+| 11  | **익명 채널에서 게시글 수정**                  | 닉네임은 동일하게 유지. (post_id, user_id)에 연결되어 있으며, 내용이 아님. 내용 수정이 닉네임을 재생성하거나 변경하지 않음.                                                                 |
+| 12  | **익명 채널에서 동시 게시글 작성**             | 두 사용자가 동시에 게시글을 작성. 각각 INSERT ON CONFLICT 패턴으로 자체 닉네임을 받음. 다른 user_id이므로 충돌 불가.                                                                        |
+| 13  | **소프트 삭제된 부모 아래의 유일한 답글 삭제** | 답글을 하드 삭제한 후 부모를 정리: 부모가 소프트 삭제되었고 답글이 0개이므로 부모도 하드 삭제. 둘 다 comment_count 감소.                                                                    |
+| 14  | **존재하지 않는 게시글/댓글에 반응**           | 404 Not Found 반환.                                                                                                                                                                         |
+| 15  | **중첩 답글 시도 (답글의 답글)**               | 400 Bad Request 반환. 앱이 삽입 전에 `parent.parent_id IS NULL`인지 확인.                                                                                                                   |
 
-## 5. Test Scenarios (Given-When-Then)
+## 5. 테스트 시나리오 (Given-When-Then)
 
-### 5.1 Anonymous Nickname
+### 5.1 익명 닉네임
 
-**T1: First-time user gets a nickname in anonymous channel**
+**T1: 익명 채널에서 첫 사용자가 닉네임을 받음**
 
-- Given: an ANONYMOUS channel with a post (id=10), user_1 has no nickname for this post
-- When: user_1 creates a comment on post 10
-- Then: a nickname is generated, stored in anonymous_nicknames, and returned in the response
+- Given: ANONYMOUS 채널에 게시글(id=10)이 있고, user_1은 이 게시글에 대한 닉네임이 없음
+- When: user_1이 게시글 10에 댓글 작성
+- Then: 닉네임이 생성되어 anonymous_nicknames에 저장되고 응답에 반환
 
-**T2: Same user gets same nickname within same post**
+**T2: 같은 사용자가 같은 게시글에서 같은 닉네임을 받음**
 
-- Given: user_1 already has nickname "Brave Whale" for post 10
-- When: user_1 creates another comment on post 10
-- Then: author.nickname is "Brave Whale" (reused, not regenerated)
+- Given: user_1이 게시글 10에 대해 "용감한 고래" 닉네임을 보유
+- When: user_1이 게시글 10에 또 다른 댓글 작성
+- Then: author.nickname은 "용감한 고래" (재사용, 재생성 아님)
 
-**T3: Same user gets different nickname on different post**
+**T3: 같은 사용자가 다른 게시글에서 다른 닉네임을 받음**
 
-- Given: user_1 has nickname "Brave Whale" for post 10
-- When: user_1 creates a comment on post 20
-- Then: a new nickname is independently generated (not "Brave Whale")
+- Given: user_1이 게시글 10에 대해 "용감한 고래" 닉네임을 보유
+- When: user_1이 게시글 20에 댓글 작성
+- Then: 새로운 닉네임이 독립적으로 생성 ("용감한 고래"가 아님)
 
-**T4: Nickname collision under concurrency**
+**T4: 동시성 하에서 닉네임 충돌**
 
-- Given: post 10 has no nicknames yet
-- When: two users simultaneously get assigned "Brave Whale"
-- Then: one succeeds, the other retries with a different nickname. Both end up with unique nicknames.
+- Given: 게시글 10에 아직 닉네임이 없음
+- When: 두 사용자가 동시에 "용감한 고래"를 배정받음
+- Then: 하나는 성공하고 다른 하나는 다른 닉네임으로 재시도. 둘 다 고유한 닉네임을 받음.
 
-**T5: Real-name channel skips nickname**
+**T5: 실명 채널에서는 닉네임 건너뜀**
 
-- Given: a REAL_NAME channel with a post
-- When: user_1 creates a comment
-- Then: author.userId is "user_1", author.nickname is null
+- Given: REAL_NAME 채널에 게시글이 있음
+- When: user_1이 댓글 작성
+- Then: author.userId는 "user_1", author.nickname은 null
 
-### 5.2 Reactions
+### 5.2 반응
 
-**T6: Add a reaction**
+**T6: 반응 추가**
 
-- Given: post 10 has 0 likes, user_1 has no reaction
-- When: user_1 sends POST /api/posts/10/reactions {"type": "LIKE"}
+- Given: 게시글 10에 좋아요 0개, user_1에 반응 없음
+- When: user_1이 POST /api/posts/10/reactions {"type": "LIKE"} 전송
 - Then: action = "ADDED", likeCount = 1, dislikeCount = 0
 
-**T7: Cancel a reaction (same type again)**
+**T7: 반응 취소 (같은 타입 재클릭)**
 
-- Given: user_1 has LIKE on post 10, likeCount = 1
-- When: user_1 sends POST /api/posts/10/reactions {"type": "LIKE"}
+- Given: user_1이 게시글 10에 LIKE 보유, likeCount = 1
+- When: user_1이 POST /api/posts/10/reactions {"type": "LIKE"} 전송
 - Then: action = "CANCELLED", type = null, likeCount = 0
 
-**T8: Switch a reaction**
+**T8: 반응 전환**
 
-- Given: user_1 has LIKE on post 10, likeCount = 1, dislikeCount = 0
-- When: user_1 sends POST /api/posts/10/reactions {"type": "DISLIKE"}
+- Given: user_1이 게시글 10에 LIKE 보유, likeCount = 1, dislikeCount = 0
+- When: user_1이 POST /api/posts/10/reactions {"type": "DISLIKE"} 전송
 - Then: action = "SWITCHED", type = "DISLIKE", likeCount = 0, dislikeCount = 1
 
-**T9: Double-click reaction (concurrent)**
+**T9: 더블클릭 반응 (동시성)**
 
-- Given: user_1 has no reaction on post 10
-- When: two identical LIKE requests arrive simultaneously
-- Then: one adds, the other catches the constraint violation and cancels. Final state: no reaction (net toggle).
+- Given: user_1이 게시글 10에 반응 없음
+- When: 동일한 LIKE 요청 두 개가 동시에 도착
+- Then: 하나가 추가하고, 다른 하나가 제약조건 위반을 캐치하여 취소. 최종 상태: 반응 없음 (순 토글).
 
-**T10: React to soft-deleted comment**
+**T10: 소프트 삭제된 댓글에 반응**
 
-- Given: comment 100 is soft-deleted (is_deleted = true)
-- When: user_1 sends POST /api/comments/100/reactions {"type": "LIKE"}
+- Given: 댓글 100이 소프트 삭제됨 (is_deleted = true)
+- When: user_1이 POST /api/comments/100/reactions {"type": "LIKE"} 전송
 - Then: 400 Bad Request
 
-### 5.3 Comments & Soft Delete
+### 5.3 댓글 & 소프트 삭제
 
-**T11: Create top-level comment**
+**T11: 최상위 댓글 작성**
 
-- Given: post 10 exists, comment_count = 0
-- When: user_1 sends POST /api/comments {"postId": 10, "parentId": null, "content": "Hello"}
-- Then: comment created, post comment_count = 1
+- Given: 게시글 10 존재, comment_count = 0
+- When: user_1이 POST /api/comments {"postId": 10, "parentId": null, "content": "안녕하세요"} 전송
+- Then: 댓글 생성, 게시글 comment_count = 1
 
-**T12: Create reply**
+**T12: 답글 작성**
 
-- Given: top-level comment 100 exists on post 10
-- When: user_2 sends POST /api/comments {"postId": 10, "parentId": 100, "content": "Reply"}
-- Then: reply created with parentId = 100, post comment_count incremented
+- Given: 게시글 10에 최상위 댓글 100이 존재
+- When: user_2가 POST /api/comments {"postId": 10, "parentId": 100, "content": "답글"} 전송
+- Then: parentId = 100인 답글 생성, 게시글 comment_count 증가
 
-**T13: Reject nested reply (reply to a reply)**
+**T13: 중첩 답글 거부 (답글의 답글)**
 
-- Given: comment 101 is a reply (parent_id = 100)
-- When: user_3 sends POST /api/comments {"postId": 10, "parentId": 101, "content": "Nested"}
+- Given: 댓글 101이 답글 (parent_id = 100)
+- When: user_3가 POST /api/comments {"postId": 10, "parentId": 101, "content": "중첩"} 전송
 - Then: 400 Bad Request
 
-**T14: Soft delete comment with replies**
+**T14: 답글이 있는 댓글 소프트 삭제**
 
-- Given: comment 100 has 2 replies, post comment_count = 3
-- When: author deletes comment 100
-- Then: comment 100 has is_deleted = true, content = null. Replies remain. comment_count stays 3.
+- Given: 댓글 100에 답글 2개, 게시글 comment_count = 3
+- When: 작성자가 댓글 100 삭제
+- Then: 댓글 100의 is_deleted = true, content = null. 답글은 유지. comment_count는 3으로 유지.
 
-**T15: Hard delete comment with no replies**
+**T15: 답글이 없는 댓글 하드 삭제**
 
-- Given: comment 100 has no replies, post comment_count = 1
-- When: author deletes comment 100
-- Then: comment 100 row is removed from DB. comment_count = 0.
+- Given: 댓글 100에 답글 없음, 게시글 comment_count = 1
+- When: 작성자가 댓글 100 삭제
+- Then: 댓글 100 행이 DB에서 제거. comment_count = 0.
 
-**T16: Hard delete a reply**
+**T16: 답글 하드 삭제**
 
-- Given: comment 101 is a reply to comment 100, post comment_count = 2
-- When: author deletes comment 101
-- Then: comment 101 row removed. comment_count = 1.
+- Given: 댓글 101이 댓글 100의 답글, 게시글 comment_count = 2
+- When: 작성자가 댓글 101 삭제
+- Then: 댓글 101 행 제거. comment_count = 1.
 
-**T17: Delete last reply under soft-deleted parent**
+**T17: 소프트 삭제된 부모 아래의 마지막 답글 삭제**
 
-- Given: comment 100 is soft-deleted, has one remaining reply (101), comment_count = 2
-- When: author deletes reply 101
-- Then: reply 101 removed. Parent 100 is also removed (cleanup). comment_count = 0.
+- Given: 댓글 100이 소프트 삭제, 남은 답글 1개(101), comment_count = 2
+- When: 작성자가 답글 101 삭제
+- Then: 답글 101 제거. 부모 100도 제거(정리). comment_count = 0.
 
-**T18: Reply to soft-deleted comment**
+**T18: 소프트 삭제된 댓글에 답글**
 
-- Given: comment 100 is soft-deleted
-- When: user sends POST /api/comments {"postId": 10, "parentId": 100, "content": "Reply"}
+- Given: 댓글 100이 소프트 삭제됨
+- When: 사용자가 POST /api/comments {"postId": 10, "parentId": 100, "content": "답글"} 전송
 - Then: 400 Bad Request
 
-### 5.4 Posts
+### 5.4 게시글
 
-**T19: View count increments on detail view**
+**T19: 상세 조회 시 조회수 증가**
 
-- Given: post 10 has view_count = 5
+- Given: 게시글 10의 view_count = 5
 - When: GET /api/posts/10
-- Then: response shows viewCount = 6
+- Then: 응답에 viewCount = 6
 
-**T20: Only author can edit post**
+**T20: 작성자만 게시글 수정 가능**
 
-- Given: post 10 is authored by user_1
-- When: user_2 sends PUT /api/posts/10
+- Given: 게시글 10의 작성자가 user_1
+- When: user_2가 PUT /api/posts/10 전송
 - Then: 403 Forbidden
 
-**T21: Only author can delete post**
+**T21: 작성자만 게시글 삭제 가능**
 
-- Given: post 10 is authored by user_1
-- When: user_2 sends DELETE /api/posts/10
+- Given: 게시글 10의 작성자가 user_1
+- When: user_2가 DELETE /api/posts/10 전송
 - Then: 403 Forbidden
 
-**T22: Delete post cascades all children**
+**T22: 게시글 삭제 시 모든 하위 항목 캐스케이드**
 
-- Given: post 10 has 3 comments, 5 reactions, 2 nicknames
-- When: author deletes post 10
-- Then: post row removed. All comments, reactions, and nicknames for post 10 are removed by CASCADE.
+- Given: 게시글 10에 댓글 3개, 반응 5개, 닉네임 2개
+- When: 작성자가 게시글 10 삭제
+- Then: 게시글 행 제거. 게시글 10의 모든 댓글, 반응, 닉네임이 CASCADE로 제거.
 
-### 5.5 Pagination
+### 5.5 페이지네이션
 
-**T23: First page (no cursor)**
+**T23: 첫 페이지 (커서 없이)**
 
-- Given: channel 1 has 25 posts
+- Given: 채널 1에 게시글 25개
 - When: GET /api/posts?channelId=1&size=20
-- Then: 20 posts returned (newest first), hasNext = true, nextCursor is set
+- Then: 20개 게시글 반환 (최신순), hasNext = true, nextCursor 설정
 
-**T24: Second page (with cursor)**
+**T24: 두 번째 페이지 (커서 사용)**
 
-- Given: channel 1 has 25 posts, cursor from T23
+- Given: 채널 1에 게시글 25개, T23의 커서
 - When: GET /api/posts?channelId=1&size=20&cursor={nextCursor}
-- Then: 5 posts returned, hasNext = false, nextCursor is null
+- Then: 5개 게시글 반환, hasNext = false, nextCursor는 null
 
-**T25: Invalid cursor**
+**T25: 유효하지 않은 커서**
 
-- Given: any state
+- Given: 임의의 상태
 - When: GET /api/posts?channelId=1&size=20&cursor=invalidgarbage
 - Then: 400 Bad Request
 
-### 5.6 Validation
+### 5.6 유효성 검증
 
-**T26: Missing X-User-Id header**
+**T26: X-User-Id 헤더 누락**
 
-- Given: any endpoint requiring auth
-- When: request sent without X-User-Id header
+- Given: 인증이 필요한 임의의 엔드포인트
+- When: X-User-Id 헤더 없이 요청 전송
 - Then: 400 Bad Request
 
-**T27: Empty post title or content**
+**T27: 비어있는 게시글 제목 또는 내용**
 
-- Given: valid channel exists
-- When: POST /api/posts {"channelId": 1, "title": "", "content": "text"}
+- Given: 유효한 채널 존재
+- When: POST /api/posts {"channelId": 1, "title": "", "content": "텍스트"}
 - Then: 400 Bad Request

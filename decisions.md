@@ -1,141 +1,141 @@
-# Decisions Log
+# 설계 결정 기록
 
-> Why I made each design choice — trade-offs, alternatives considered, and reasoning.
+> 각 설계 선택의 이유 — 트레이드오프, 고려한 대안, 그리고 판단 근거.
 
-## Scenario Choice
+## 시나리오 선택
 
-**Chose S2 (Anonymous Community Board)** over S1 (Medicine Inventory).
-- I have direct experience building community/social features — have built two platforms with similar patterns (reactions, counters, pagination)
-- More confident defending these design decisions in interview
-- The edge cases (anonymous identity, reactions, soft delete) align with problems I've solved before
-
----
-
-## Key Decisions
-
-### 1. Anonymous Nickname Scoping
-
-**Problem:** User A should be "Brave Whale" in post 1 but "Quiet Dolphin" in post 2. The scope is (user, post) — same user, same post = same nickname.
-
-**Considered:**
-- **Option A: Hash-based** — deterministic hash of (user_id + post_id) mapped to a nickname. No DB table needed. But: hard to guarantee uniqueness (two different user+post combos could hash to the same nickname), and no way to retry on collision.
-- **Option B: Dedicated mapping table** — `anonymous_nicknames(post_id, user_id, nickname)` with two unique constraints.
-
-**Chose Option B.** The table makes the scoping explicit and the two unique constraints (`post_id, user_id` and `post_id, nickname`) enforce both rules at the DB level. It's a few extra rows but the correctness guarantee is worth it.
-
-### 2. Nickname Concurrency
-
-**Problem:** Two users comment on the same post simultaneously and randomly get assigned the same nickname.
-
-**Considered:**
-- **Pessimistic locking** — `SELECT FOR UPDATE` before inserting. Guarantees no collision but adds lock contention and complexity. Also, there's no existing row to lock for a first-time user.
-- **Optimistic concurrency** — try the INSERT, let the DB unique constraint reject duplicates, retry with a new nickname on failure.
-
-**Chose optimistic concurrency.** The collision (two users getting the same random nickname from a pool of 2,500) is extremely rare. When it does happen, the DB constraint catches it cleanly and we retry. No locking overhead for the 99.99% case. Same pattern used for reaction double-click prevention — consistent approach across the codebase.
-
-### 3. Reaction Toggle Design
-
-**Problem:** Like/dislike has three behaviors from one action — add, cancel, switch. How should the API work?
-
-**Considered:**
-- **Separate endpoints** — `PUT /reactions` to add/switch, `DELETE /reactions` to cancel. Semantically "correct" but forces the frontend to track current state and decide which verb to use.
-- **Single toggle endpoint** — `POST /reactions {"type": "LIKE"}`. Backend checks current state and determines the action (add, cancel, or switch).
-
-**Chose single toggle.** The frontend just says "user tapped the like button" — the backend figures out the intent. One endpoint, one request body, simpler client code. POST isn't semantically perfect (it usually means "create"), but the pragmatism wins here. This is how most social platforms handle it.
-
-### 4. Soft Delete for Comments
-
-**Problem:** Deleting a comment that has replies — should we remove it entirely or keep a placeholder?
-
-**Considered:**
-- **Hard delete always** — simple, but breaks the reply thread structure. Replies become orphaned with no visible parent context.
-- **Soft delete with `is_deleted` flag** — keep the row, set content to NULL, show "deleted comment" placeholder. Replies remain attached.
-
-**Chose soft delete when replies exist, hard delete otherwise.** This preserves thread structure while not keeping unnecessary rows. The `is_deleted` flag + nullable content makes it clean.
-
-**Additional decision — `ON DELETE RESTRICT` for `parent_id`:** If a bug in app logic tries to hard-delete a comment that has replies, RESTRICT makes the DB throw an error instead of silently cascading. Bugs should be loud, not destructive. Data loss from a silent CASCADE is far worse than a caught exception.
-
-**Comment count behavior:** Soft-deleted comments are still visible (as placeholders), so we do NOT decrement `comment_count` on soft delete. Only hard deletes decrement. This matches Reddit's behavior — users see the count matching what's on screen.
-
-**Cleanup:** When the last reply under a soft-deleted parent is deleted, the parent is also cleaned up (hard-deleted). This prevents dead placeholders with no children lingering forever.
-
-### 5. Counts Strategy (COUNT vs Denormalized)
-
-**Problem:** Post listings need like_count, dislike_count, comment_count. Calculate on the fly or store?
-
-**Considered:**
-- **COUNT queries** — `SELECT COUNT(*) FROM reactions WHERE post_id = ?`. Always accurate. But: a listing of 20 posts = 20+ COUNT subqueries or complex JOINs. Slow as data grows.
-- **Denormalized counters** — store counts directly on the posts/comments rows. Fast reads, but must keep in sync on every write.
-
-**Chose denormalized counters.** I've built two platforms with this pattern. It's harder to implement correctly, but:
-- Community boards are read-heavy — far more views than reactions/comments
-- Sync correctness is guaranteed by wrapping counter updates in the same `@Transactional` as the write operation
-- Added `CHECK (>= 0)` constraints on all count columns so a sync bug can never produce negative numbers — the DB will throw an error instead
-- This is what production community platforms do (Reddit, Hacker News, etc.)
-
-### 6. Pagination Strategy
-
-**Problem:** How to paginate post and comment listings.
-
-**Considered:**
-- **Offset-based** (`?page=1&size=20`) — simple, allows "jump to page N". But: if new posts are created while browsing, data shifts and users see duplicates. Also, `OFFSET 10000` is slow (DB scans and skips N rows).
-- **Cursor-based** (`?cursor=xxx&size=20`) — stable pagination, no duplicates when new data arrives. Fast queries using `WHERE (created_at, id) < (cursor)`. But: no "jump to page 5".
-
-**Chose cursor-based.** A community board with active posting is exactly the use case where offset pagination breaks — new posts shift the data between page loads. Cursor gives stable results. The lack of "jump to page N" is acceptable — users typically scroll through feeds linearly, not jump to page 47.
-
-Cursor encodes `(created_at, id)` in base64 — using both fields ensures uniqueness even when posts have identical timestamps.
-
-### 7. View Count — Unique vs Raw
-
-**Problem:** Should view_count track total views or unique views per user?
-
-**Considered:**
-- **Unique views** — requires a `post_views(post_id, user_id)` table. Every read becomes a read + write. Accurate but adds write overhead to the most common operation (viewing).
-- **Raw count** — simple `view_count + 1` increment. Every page load counts. Inflated number but zero overhead.
-
-**Chose raw count.** For a seafarer community (not millions of users), the simplicity wins. Unique tracking would turn every read into a write operation — bad trade-off for a feature that doesn't need precision. The requirement says "view count increases on detail view" without specifying uniqueness.
-
-### 8. Reaction Tables — Single vs Separate
-
-**Problem:** Reactions can target posts or comments. One table or two?
-
-**Considered:**
-- **Single polymorphic table** — `reactions(target_type, target_id, user_id, type)`. One table, simpler code. But: can't use foreign keys (target_id could point to either table). Orphan cleanup relies on app logic.
-- **Two tables** — `post_reactions` and `comment_reactions`. Proper foreign keys with ON DELETE CASCADE. DB handles cleanup. But: toggle logic is written in two places.
-
-**Chose two separate tables.** Proper FK constraints mean the DB guarantees referential integrity and handles cascade deletes automatically. The "duplicate logic" concern is minor — in Spring Boot, a shared service method handles the toggle algorithm, and both repositories call into it. More tables is fine when the architecture is cleaner for it.
-
-### 9. URL Structure — Nested vs Flat
-
-**Problem:** Should posts be at `/channels/{id}/posts/{id}` or `/posts/{id}`?
-
-**Considered:**
-- **Nested** — `/channels/{channelId}/posts/{postId}` makes the relationship explicit but the channelId is redundant for detail/edit/delete (postId already implies the channel).
-- **Flat** — `/posts/{postId}` for everything. channelId is a query parameter for listing.
-
-**Chose flat.** Mixing nested (for create/list) and flat (for detail/edit/delete) is inconsistent. All-flat keeps URLs uniform. The channel relationship is expressed through the channelId field in request bodies and query params, not URL nesting. Applied the same pattern to comments.
+**S2 (익명 커뮤니티 게시판)** 를 S1 (의약품 재고 관리) 대신 선택했습니다.
+- 커뮤니티/소셜 기능을 직접 구축한 경험이 있습니다 — 유사한 패턴(반응, 카운터, 페이지네이션)을 가진 두 개의 플랫폼을 만들어 본 적이 있습니다
+- 면접에서 이 설계 결정들을 더 자신 있게 설명할 수 있습니다
+- 엣지 케이스(익명 닉네임, 반응, 소프트 삭제)가 이전에 해결해 본 문제와 일치합니다
 
 ---
 
-## Ambiguous Requirements — My Interpretations
+## 주요 설계 결정
 
-1. **"View count increases on detail view"** — interpreted as raw count, not unique per user. The requirement doesn't mention uniqueness, and unique tracking adds significant complexity for minimal value at this scale.
+### 1. 익명 닉네임 범위(Scoping)
 
-2. **"Comments can be deleted"** — interpreted as: soft delete (placeholder) when replies exist, hard delete when no replies. The requirement says "replace content with placeholder when replies exist" but doesn't specify what happens when there are no replies — hard delete is the reasonable choice.
+**문제:** 사용자 A는 게시글 1에서 "용감한 고래", 게시글 2에서 "조용한 돌고래"여야 합니다. 범위는 (사용자, 게시글) — 같은 사용자, 같은 게시글 = 같은 닉네임.
 
-3. **"Channel management"** — interpreted as create + list only. The requirement says "channels exist" but doesn't specify update/delete for channels. Kept it minimal.
+**고려한 방안:**
+- **방안 A: 해시 기반** — (user_id + post_id)의 결정적 해시를 닉네임에 매핑. DB 테이블 불필요. 하지만: 유일성 보장이 어렵고 (서로 다른 user+post 조합이 같은 닉네임으로 해시될 수 있음), 충돌 시 재시도 방법이 없습니다.
+- **방안 B: 전용 매핑 테이블** — `anonymous_nicknames(post_id, user_id, nickname)`에 두 개의 유니크 제약조건.
 
-4. **"Pagination for post listing"** — only post listings are explicitly required to be paginated. I also added pagination to comment listing as a practical measure, since comment threads can grow unbounded.
+**방안 B를 선택했습니다.** 테이블이 범위를 명시적으로 만들고, 두 유니크 제약조건(`post_id, user_id`와 `post_id, nickname`)이 DB 수준에서 두 규칙을 모두 강제합니다. 행이 약간 추가되지만 정확성 보장의 가치가 있습니다.
 
-5. **Self-reactions** — the requirement doesn't mention whether users can react to their own content. Allowed it — most platforms (Reddit, YouTube) allow this, and blocking it adds complexity with no clear benefit.
+### 2. 닉네임 동시성
+
+**문제:** 두 사용자가 같은 게시글에 동시에 댓글을 달면서 무작위로 같은 닉네임을 배정받는 경우.
+
+**고려한 방안:**
+- **비관적 잠금(Pessimistic locking)** — INSERT 전에 `SELECT FOR UPDATE`. 충돌 없음을 보장하지만 락 경합과 복잡성이 추가됩니다. 또한, 첫 사용자에게는 잠글 기존 행이 없습니다.
+- **낙관적 동시성(Optimistic concurrency)** — INSERT를 시도하고, DB 유니크 제약조건이 중복을 거부하면, 새 닉네임으로 재시도.
+
+**낙관적 동시성을 선택했습니다.** 2,500개 풀에서 두 사용자가 같은 무작위 닉네임을 받을 확률은 극히 낮습니다. 발생하면 DB 제약조건이 깔끔하게 잡아주고 재시도합니다. 99.99%의 경우에 대해 잠금 오버헤드가 없습니다. 반응 더블클릭 방지에도 같은 패턴을 사용하여 코드베이스 전체에서 일관된 접근 방식입니다.
+
+### 3. 반응(Reaction) 토글 설계
+
+**문제:** 좋아요/싫어요는 하나의 액션으로 세 가지 동작 — 추가, 취소, 전환. API를 어떻게 설계할 것인가?
+
+**고려한 방안:**
+- **별도 엔드포인트** — `PUT /reactions`로 추가/전환, `DELETE /reactions`로 취소. 의미론적으로는 "올바르지만" 프론트엔드가 현재 상태를 추적하고 어떤 HTTP 메서드를 사용할지 결정해야 합니다.
+- **단일 토글 엔드포인트** — `POST /reactions {"type": "LIKE"}`. 백엔드가 현재 상태를 확인하고 동작(추가, 취소, 전환)을 결정.
+
+**단일 토글을 선택했습니다.** 프론트엔드는 "사용자가 좋아요 버튼을 눌렀다"라고만 전달하면 — 백엔드가 의도를 파악합니다. 하나의 엔드포인트, 하나의 요청 본문, 더 간단한 클라이언트 코드. POST가 의미론적으로 완벽하지는 않지만 (보통 "생성"을 의미) 실용성이 우선합니다. 대부분의 소셜 플랫폼이 이렇게 처리합니다.
+
+### 4. 댓글 소프트 삭제
+
+**문제:** 답글이 있는 댓글 삭제 — 완전히 제거할 것인가, 플레이스홀더를 유지할 것인가?
+
+**고려한 방안:**
+- **항상 하드 삭제** — 간단하지만 답글 스레드 구조가 깨집니다. 답글이 부모 컨텍스트 없이 고아가 됩니다.
+- **`is_deleted` 플래그로 소프트 삭제** — 행을 유지하고, 내용을 NULL로 설정, "삭제된 댓글" 플레이스홀더 표시. 답글은 유지됩니다.
+
+**답글이 있으면 소프트 삭제, 없으면 하드 삭제를 선택했습니다.** 스레드 구조를 보존하면서 불필요한 행을 남기지 않습니다. `is_deleted` 플래그 + nullable 컨텐츠로 깔끔하게 처리됩니다.
+
+**추가 결정 — `parent_id`에 `ON DELETE RESTRICT`:** 앱 로직의 버그가 답글이 있는 댓글을 하드 삭제하려 하면, RESTRICT가 조용히 CASCADE하는 대신 DB 에러를 발생시킵니다. 버그는 시끄러워야 하며, 파괴적이어서는 안 됩니다. 조용한 CASCADE로 인한 데이터 손실은 잡힌 예외보다 훨씬 심각합니다.
+
+**댓글 수(comment_count) 동작:** 소프트 삭제된 댓글은 여전히 (플레이스홀더로) 표시되므로 소프트 삭제 시 `comment_count`를 감소시키지 않습니다. 하드 삭제만 감소시킵니다. 이는 Reddit의 동작과 일치합니다 — 사용자가 보는 수가 화면에 보이는 것과 일치합니다.
+
+**정리(Cleanup):** 소프트 삭제된 부모 아래의 마지막 답글이 삭제되면, 부모도 함께 정리(하드 삭제)됩니다. 자식 없는 플레이스홀더가 영원히 남는 것을 방지합니다.
+
+### 5. 카운트 전략 (COUNT vs 비정규화)
+
+**문제:** 게시글 목록에 like_count, dislike_count, comment_count가 필요합니다. 매번 계산할 것인가, 저장할 것인가?
+
+**고려한 방안:**
+- **COUNT 쿼리** — `SELECT COUNT(*) FROM reactions WHERE post_id = ?`. 항상 정확합니다. 하지만: 20개 게시글 목록 = 20개 이상의 COUNT 서브쿼리 또는 복잡한 JOIN. 데이터가 늘어나면 느려집니다.
+- **비정규화 카운터** — posts/comments 행에 카운트를 직접 저장. 읽기가 빠르지만 매 쓰기마다 동기화를 유지해야 합니다.
+
+**비정규화 카운터를 선택했습니다.** 이 패턴으로 두 개의 플랫폼을 구축한 경험이 있습니다. 올바르게 구현하기는 더 어렵지만:
+- 커뮤니티 게시판은 읽기 중심 — 반응/댓글보다 조회가 훨씬 많습니다
+- 동기화 정확성은 카운터 업데이트를 쓰기 작업과 같은 `@Transactional` 내에서 래핑하여 보장합니다
+- 모든 카운트 컬럼에 `CHECK (>= 0)` 제약조건을 추가하여 동기화 버그가 절대 음수를 생성할 수 없게 했습니다 — DB가 대신 에러를 발생시킵니다
+- 이것이 프로덕션 커뮤니티 플랫폼(Reddit, Hacker News 등)이 사용하는 방식입니다
+
+### 6. 페이지네이션 전략
+
+**문제:** 게시글 및 댓글 목록을 어떻게 페이지네이션할 것인가.
+
+**고려한 방안:**
+- **Offset 기반** (`?page=1&size=20`) — 간단하고, "N페이지로 이동" 가능. 하지만: 브라우징 중 새 게시글이 생성되면 데이터가 이동하여 중복이 발생합니다. 또한, `OFFSET 10000`은 느립니다 (DB가 N개 행을 스캔하고 건너뜀).
+- **Cursor 기반** (`?cursor=xxx&size=20`) — 안정적인 페이지네이션, 새 데이터 도착 시 중복 없음. `WHERE (created_at, id) < (cursor)`를 사용한 빠른 쿼리. 하지만: "5페이지로 이동" 불가.
+
+**Cursor 기반을 선택했습니다.** 활발한 게시가 이루어지는 커뮤니티 게시판은 정확히 offset 페이지네이션이 깨지는 유스케이스입니다 — 새 게시글이 페이지 로드 사이에 데이터를 이동시킵니다. Cursor는 안정적인 결과를 제공합니다. "N페이지로 이동"이 불가능한 것은 수용 가능합니다 — 사용자는 보통 피드를 순차적으로 스크롤하지, 47페이지로 점프하지 않습니다.
+
+Cursor는 `(created_at, id)`를 base64로 인코딩합니다 — 두 필드를 모두 사용하여 게시글의 타임스탬프가 동일한 경우에도 유일성을 보장합니다.
+
+### 7. 조회수 — 고유 vs 누적
+
+**문제:** view_count가 총 조회수를 추적할 것인가, 사용자별 고유 조회수를 추적할 것인가?
+
+**고려한 방안:**
+- **고유 조회수** — `post_views(post_id, user_id)` 테이블 필요. 모든 읽기가 읽기 + 쓰기가 됩니다. 정확하지만 가장 빈번한 작업(조회)에 쓰기 오버헤드를 추가합니다.
+- **누적 카운트** — 단순한 `view_count + 1` 증가. 모든 페이지 로드가 카운트됩니다. 부풀려진 숫자지만 오버헤드 제로.
+
+**누적 카운트를 선택했습니다.** 선원 커뮤니티(수백만 사용자가 아닌)에서는 단순함이 이깁니다. 고유 추적은 모든 읽기를 쓰기 작업으로 바꿀 것입니다 — 정밀도가 필요 없는 기능에 대해 나쁜 트레이드오프입니다. 요구사항은 "상세 조회 시 조회수 증가"라고만 되어 있으며 고유성을 명시하지 않습니다.
+
+### 8. 반응 테이블 — 단일 vs 분리
+
+**문제:** 반응은 게시글 또는 댓글을 대상으로 할 수 있습니다. 하나의 테이블인가, 두 개인가?
+
+**고려한 방안:**
+- **단일 다형성 테이블** — `reactions(target_type, target_id, user_id, type)`. 테이블 하나, 코드가 간단합니다. 하지만: 외래 키를 사용할 수 없습니다 (target_id가 어느 테이블을 가리키는지 알 수 없음). 고아 정리가 앱 로직에 의존합니다.
+- **두 개의 테이블** — `post_reactions`와 `comment_reactions`. 적절한 외래 키와 ON DELETE CASCADE. DB가 정리를 처리합니다. 하지만: 토글 로직이 두 곳에 작성됩니다.
+
+**두 개의 분리된 테이블을 선택했습니다.** 적절한 FK 제약조건은 DB가 참조 무결성을 보장하고 캐스케이드 삭제를 자동으로 처리한다는 것을 의미합니다. "중복 로직" 우려는 사소합니다 — Spring Boot에서는 공유 서비스 메서드가 토글 알고리즘을 처리하고, 양쪽 리포지토리가 이를 호출합니다. 아키텍처가 더 깔끔해진다면 테이블이 더 많아도 괜찮습니다.
+
+### 9. URL 구조 — 중첩 vs 플랫
+
+**문제:** 게시글이 `/channels/{id}/posts/{id}`에 있어야 하는가, `/posts/{id}`에 있어야 하는가?
+
+**고려한 방안:**
+- **중첩** — `/channels/{channelId}/posts/{postId}`는 관계를 명시적으로 만들지만 상세/수정/삭제에서 channelId가 중복됩니다 (postId가 이미 채널을 암시).
+- **플랫** — `/posts/{postId}` 통일. channelId는 목록 조회의 쿼리 파라미터.
+
+**플랫을 선택했습니다.** 중첩(생성/목록)과 플랫(상세/수정/삭제)을 혼합하면 일관성이 없습니다. 전부 플랫으로 통일하면 URL이 균일합니다. 채널 관계는 요청 본문과 쿼리 파라미터의 channelId 필드로 표현되며, URL 중첩이 아닙니다. 댓글에도 같은 패턴을 적용했습니다.
 
 ---
 
-## If I Had More Time
+## 모호한 요구사항 — 나의 해석
 
-1. **Rate limiting** — prevent abuse of reaction toggling, comment spam, and view count inflation
-2. **Nickname theming per channel** — instead of one global adjective+animal pool, each channel could have its own themed pool (sea creatures for maritime channels, etc.)
-3. **Comment pagination for replies** — currently all replies under a top-level comment are loaded at once. For extremely active threads, this could be paginated too
-4. **Audit log** — track all mutations (create, update, delete) for moderation purposes
-5. **Database index optimization** — after load testing, add covering indexes for the most common query patterns
-6. **Count reconciliation job** — a scheduled task that recalculates denormalized counts from the source tables, as a safety net against sync drift
+1. **"상세 조회 시 조회수 증가"** — 사용자별 고유 조회가 아닌 누적 카운트로 해석했습니다. 요구사항이 고유성을 언급하지 않으며, 이 규모에서 고유 추적은 최소한의 가치에 비해 상당한 복잡성을 추가합니다.
+
+2. **"댓글 삭제 가능"** — 답글이 있으면 소프트 삭제(플레이스홀더), 답글이 없으면 하드 삭제로 해석했습니다. 요구사항은 "답글이 있으면 내용을 플레이스홀더로 대체"라고 하지만 답글이 없는 경우를 명시하지 않습니다 — 하드 삭제가 합리적인 선택입니다.
+
+3. **"채널 관리"** — 생성 + 목록 조회만으로 해석했습니다. 요구사항은 "채널이 존재한다"고 하지만 채널의 수정/삭제를 명시하지 않습니다. 최소한으로 유지했습니다.
+
+4. **"게시글 목록 페이지네이션"** — 게시글 목록만 명시적으로 페이지네이션이 요구됩니다. 댓글 목록에도 실용적인 차원에서 페이지네이션을 추가했는데, 댓글 스레드가 무한히 늘어날 수 있기 때문입니다.
+
+5. **자기 반응** — 요구사항이 사용자가 자신의 콘텐츠에 반응할 수 있는지 언급하지 않습니다. 허용했습니다 — 대부분의 플랫폼(Reddit, YouTube)이 이를 허용하며, 차단하면 명확한 이점 없이 복잡성만 추가됩니다.
+
+---
+
+## 시간이 더 있었다면
+
+1. **Rate limiting** — 반응 토글 남용, 댓글 스팸, 조회수 부풀리기 방지
+2. **채널별 닉네임 테마** — 하나의 글로벌 형용사+동물 풀 대신, 각 채널이 자체 테마 풀을 가질 수 있음 (해양 채널에는 해양 생물 등)
+3. **답글 페이지네이션** — 현재 최상위 댓글 아래의 모든 답글이 한 번에 로드됩니다. 매우 활발한 스레드에서는 이것도 페이지네이션할 수 있습니다
+4. **감사 로그(Audit log)** — 모든 변경(생성, 수정, 삭제)을 모더레이션 목적으로 추적
+5. **데이터베이스 인덱스 최적화** — 부하 테스트 후, 가장 빈번한 쿼리 패턴에 대해 커버링 인덱스 추가
+6. **카운트 재조정 작업** — 소스 테이블에서 비정규화된 카운트를 재계산하는 스케줄된 작업, 동기화 드리프트에 대한 안전망
